@@ -5,6 +5,9 @@ import Stripe from "stripe";
 export const PORT = Number(process.env.PORT || 10000);
 export const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "*";
 
+// Recommended: set TZ=America/Chicago in your deployment environment (Render)
+export const TZ = process.env.TZ || "America/Chicago";
+
 // default admin key matches your local PS example
 export const ADMIN_KEY = process.env.ADMIN_KEY || "893889";
 

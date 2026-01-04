@@ -1,64 +1,87 @@
 // backend/src/auth/pass.js
-import crypto from "crypto";
-import { PASS_SECRET } from "../config.js";
-
-export const PASS_COOKIE = "cryptic_pass";
-
-function sign(obj) {
-  const json = JSON.stringify(obj);
-  const sig = crypto.createHmac("sha256", PASS_SECRET).update(json).digest("hex");
-  return Buffer.from(json).toString("base64url") + "." + sig;
+function normId(x) {
+  return String(x || "").trim().toLowerCase();
 }
 
-function verify(token) {
-  if (!token || typeof token !== "string") return null;
-  const [b64, sig] = token.split(".");
-  if (!b64 || !sig) return null;
+export function setSessionUser(req, user, { expiresAt = null } = {}) {
+  if (!req.session) return;
 
-  const expected = crypto.createHmac("sha256", PASS_SECRET).update(b64).digest("hex");
-  const a = Buffer.from(sig);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length) return null;
-  if (!crypto.timingSafeEqual(a, b)) return null;
+  req.session.user = {
+    id: normId(user.id),
+    un: String(user.un || "").trim(),
+    email: String(user.email || "").trim(),
+    host: !!user.host,
+    expiresAt: expiresAt ? Number(expiresAt) : null,
+  };
+}
 
+export function clearSession(req) {
   try {
-    return JSON.parse(Buffer.from(b64, "base64url").toString("utf8"));
-  } catch {
-    return null;
+    if (req.session) req.session.user = null;
+
+    // Best effort: destroy session backing store
+    if (req.session?.destroy) {
+      req.session.destroy(() => {});
+    }
+  } catch (_) {}
+}
+
+export function getSessionUser(req) {
+  const u = req.session?.user;
+  if (!u?.id) return null;
+
+  return {
+    id: normId(u.id),
+    un: String(u.un || "").trim(),
+    email: String(u.email || "").trim(),
+    host: !!u.host,
+    expiresAt: u.expiresAt ? Number(u.expiresAt) : null,
+  };
+}
+
+/**
+ * Expires non-host sessions after the 24h cipher window.
+ * If expired => clears session and returns { ok:false, code:"session_expired" }
+ */
+export function enforceSessionExpiry(req, state) {
+  const me = getSessionUser(req);
+  if (!me) return { ok: true, me: null };
+
+  // Host tokens never expire
+  if (me.host) return { ok: true, me };
+
+  const n = Date.now();
+
+  // Primary expiry: stored session expiresAt
+  if (me.expiresAt && n >= me.expiresAt) {
+    clearSession(req);
+    return { ok: false, code: "session_expired" };
   }
+
+  // Secondary safety: if cipher window ended, expire anyway
+  if (state?.cipherUntil && n >= Number(state.cipherUntil)) {
+    clearSession(req);
+    return { ok: false, code: "session_expired" };
+  }
+
+  return { ok: true, me };
 }
 
-export function setPassCookie(res, { userId, cycleId }, expiresAtMs) {
-  const token = sign({ userId, cycleId });
-  const expires = new Date(expiresAtMs);
-  res.setHeader("Set-Cookie", `${PASS_COOKIE}=${token}; Path=/; Expires=${expires.toUTCString()}; HttpOnly; SameSite=Lax`);
-}
-
-export function clearPassCookie(res) {
-  res.setHeader("Set-Cookie", `${PASS_COOKIE}=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax`);
-}
-
-export function passIsValid(req, { state }) {
-  const cookie = req.headers.cookie || "";
-  const match = cookie.match(new RegExp(`${PASS_COOKIE}=([^;]+)`));
-  const payload = verify(match?.[1] || "");
-  if (!payload) return { ok: false, reason: "no_pass" };
-
-  if (payload.cycleId !== state.cycleId) return { ok: false, reason: "cycle_mismatch" };
-  if (state.phase !== "SOLVE") return { ok: true, userId: payload.userId, cycleId: payload.cycleId, canSubmit: false };
-
-  const used = state.attempts?.[`${state.cycleId}:${payload.userId}`]?.used || 0;
-  const attemptsRemaining = Math.max(0, 3 - used);
-  const canSubmit = !state.winner && state.phase === "SOLVE" && attemptsRemaining > 0;
-
-  return { ok: true, userId: payload.userId, cycleId: payload.cycleId, attemptsRemaining, canSubmit };
-}
-
-export function requireSolveAuth(ctx) {
+/**
+ * Reusable middleware to protect endpoints:
+ * - must be logged in
+ * - non-host must not be expired
+ */
+export function requireUser({ state }) {
   return (req, res, next) => {
-    const v = ctx ? passIsValid(req, ctx) : null;
-    if (!v?.ok) return res.status(401).json({ ok: false, reason: v?.reason });
-    req.session = v;
+    const exp = enforceSessionExpiry(req, state);
+    if (!exp.ok) {
+      return res.status(401).json({ ok: false, code: exp.code || "session_expired" });
+    }
+    if (!exp.me) {
+      return res.status(401).json({ ok: false, code: "not_logged_in" });
+    }
+    req.me = exp.me;
     next();
   };
 }

@@ -2,9 +2,9 @@
 import express from "express";
 import http from "http";
 import cors from "cors";
-import bcrypt from "bcryptjs";
+import session from "express-session";
 
-import { PORT, ALLOWED_ORIGIN } from "./config.js";
+import { PORT, ALLOWED_ORIGIN, PASS_SECRET } from "./config.js";
 
 import { state, paidByCycle, devicePasswords } from "./state/store.js";
 import { getPublicState as _getPublicState } from "./state/publicState.js";
@@ -17,10 +17,26 @@ import { makeAuthRoutes } from "./routes/authRoutes.js";
 import { makeCheckoutRoutes } from "./routes/checkoutRoutes.js";
 import { makeAdminRoutes } from "./routes/adminRoutes.js";
 import { makeSolveRoutes } from "./routes/solveRoutes.js";
-import session from "express-session";
+import { initFirebaseAdmin } from "./firebaseAdmin.js";
+import { requireFirebaseAuth } from "./middleware/requireFirebaseAuth.js";
 
+
+/**
+ * Force a stable server timezone for weekly schedule logic.
+ * (Recommended: also set TZ=America/Chicago in Render env vars.)
+ */
+if (!process.env.TZ) process.env.TZ = "America/Chicago";
 
 const app = express();
+
+initFirebaseAdmin();
+
+// If deploying behind Render/NGINX/Cloudflare etc, this enables secure cookies + correct IPs
+app.set("trust proxy", 1);
+
+const isProd = process.env.NODE_ENV === "production";
+app.use(makeStripeWebhookRoute({ paidByCycle }));
+
 
 /* CORS */
 app.use(
@@ -32,111 +48,55 @@ app.use(
       return cb(new Error("Not allowed by CORS"));
     },
     credentials: true,
+    optionsSuccessStatus: 204,
+    allowedHeaders: ["Content-Type", "x-admin-key", "Authorization"],
   })
 );
 
-app.use(session({
-  secret: PASS_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: { httpOnly: true, sameSite: "lax", secure: false }
-}));
+/* SESSION */
+app.use(
+  session({
+    secret: PASS_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: "lax",
+      secure: isProd, // true on HTTPS in production
+    },
+  })
+);
 
 /* SERVER + WS */
 const server = http.createServer(app);
 const getPublicState = () => _getPublicState(state);
 const { wsBroadcast, pushState } = initWs({ server, getPublicState });
 
-/* STRIPE WEBHOOK */
+/* STRIPE WEBHOOK (must be before json if using raw body inside webhook route) */
 app.use(makeStripeWebhookRoute({ state, paidByCycle }));
 
 /* JSON BODY */
 app.use(express.json({ limit: "256kb" }));
 
-/* ANSWER NORMALIZATION */
-function normalizeAnswer(s = "") {
-  return s.toLowerCase().trim().replace(/\s+/g, " ");
-}
+app.get("/api/me", requireFirebaseAuth, (req, res) => {
+  res.json({ ok: true, uid: req.user.uid, email: req.user.email });
+});
 
-/* AUTH MIDDLEWARE */
-function requireAuth(req, res, next) {
-  if (!req.session?.user) return res.status(401).json({ ok: false });
-  next();
-}
-
-/* SOLVE MIDDLEWARE */
-function requirePaidForSolve(req, res, next) {
-  const cycleId = state.cycleId;
-  const userId = req.session.user.id;
-  const paid = paidByCycle[cycleId]?.[userId];
-  if (!paid) return res.status(403).json({ ok: false });
-  next();
-}
 
 /* ROUTES */
 app.use(makeBasicRoutes({ getPublicState }));
-app.use(makeSolveRoutes({ state, paidByCycle, wsBroadcast }));
-app.use(makeAuthRoutes({ state, paidByCycle, devicePasswords }));
+
+// ✅ authRoutes version you currently have reads state from store.js internally
+app.use(makeAuthRoutes({ paidByCycle, devicePasswords }));
+
 app.use(makeCheckoutRoutes({ state, paidByCycle }));
+
+// NOTE: pushState passed in so solve submissions/winner updates can broadcast cleanly.
+app.use(makeSolveRoutes({ state, paidByCycle, wsBroadcast, pushState }));
+
 app.use(
-  "/api/solve",
-  requireAuth,
-  requirePaidForSolve,
-  express.Router()
-    .get("/state", (req, res) => {
-      const cycleId = state.cycleId;
-      const userId = req.session.user.id;
-      const used = state.attempts?.[`${cycleId}:${userId}`]?.used || 0;
-      const attemptsRemaining = Math.max(0, 3 - used);
-      const phase = state.phase;
-      const now = Date.now();
-      const solveEndsAt = state.zeroAt + 24 * 3600 * 1000;
-      const revealEndsAt = solveEndsAt + 8 * 3600 * 1000;
-      const timeLeftMs = phase === "SOLVE" ? solveEndsAt - now : phase === "REVEAL" ? revealEndsAt - now : 0;
-      const solved = !!state.winner;
-      const canSubmit = !solved && phase === "SOLVE" && attemptsRemaining > 0;
-      const revealOpen = phase === "REVEAL";
-      const cipher = solved || phase !== "SOLVE" ? null : state.cipher;
-
-      res.json({
-        phase,
-        cycleId,
-        timeLeftMs: Math.max(0, timeLeftMs),
-        solved,
-        canSubmit,
-        revealOpen,
-        attemptsRemaining,
-        canSubmit,
-        cipher,
-      });
-    })
-    .post("/submit", (req, res) => {
-      const { answer } = req.body;
-      const cycleId = state.cycleId;
-      const userId = req.session.user.id;
-      const key = `${cycleId}:${userId}`;
-      state.attempts[key] ||= { used: 0 };
-      if (state.winner) return res.json({ ok: false, solved: true });
-      if (state.phase !== "SOLVE") return res.json({ ok: false });
-      if (state.attempts[key].used >= 3) return res.json({ ok: false, lockedOut: true });
-
-      const normIn = normalizeAnswer(answer);
-      const normAns = normalizeAnswer(state.canonicalAnswer);
-      state.attempts[key].used++;
-
-      if (normIn === normAns && !state.winner) {
-        state.winner = { userId, un: req.session.user.un, ts: now, answer: normAns };
-        wsBroadcast("SOLVED", { un: req.session.user.un, ts: state.winner.ts });
-        return res.json({ ok: true, solved: true });
-      }
-
-      const attemptsRemaining = Math.max(0, 3 - state.attempts[key].used);
-      res.json({ ok: false, attemptsRemaining, lockedOut: attemptsRemaining === 0 });
-    })
+  makeAdminRoutes({ state, paidByCycle, pushState, wsBroadcast, getPublicState })
 );
-
-/* ADMIN ROUTES */
-app.use(makeAdminRoutes({ state, paidByCycle, pushState, wsBroadcast, getPublicState }));
 
 /* TICK LOOP */
 startTickLoop({ state, paidByCycle, wsBroadcast, pushState });
@@ -145,4 +105,8 @@ startTickLoop({ state, paidByCycle, wsBroadcast, pushState });
 server.listen(PORT, () => {
   console.log(`[cryptic] server listening on :${PORT}`);
   console.log(`[cryptic] ws path: /ws`);
+  console.log(`[cryptic] TZ=${process.env.TZ}`);
+  console.log(
+    `[cryptic] schedule: RUNNING Sun 12:00 → Sat 08:00, CIPHER Sat 08:00 → Sun 08:00 (America/Chicago)`
+  );
 });

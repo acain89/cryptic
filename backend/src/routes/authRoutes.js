@@ -1,56 +1,195 @@
 // backend/src/routes/authRoutes.js
 import express from "express";
 import bcrypt from "bcryptjs";
-import { devicePasswords } from "../state/store.js";
-import { setPassCookie, clearPassCookie } from "../auth/pass.js";
-import { now } from "../util/time.js";
+import { setSessionUser, clearSession, enforceSessionExpiry } from "../auth/pass.js";
 
-export function makeAuthRoutes({ state, paidByCycle }) {
+export function makeAuthRoutes({ state, paidByCycle, devicePasswords }) {
   const router = express.Router();
 
-  router.post("/api/auth/signup", async (req, res) => {
+  function normId(x) {
+    return String(x || "").trim().toLowerCase();
+  }
+
+  function cleanOneLine(s, max = 24) {
+    return String(s || "").replace(/\s+/g, " ").trim().slice(0, max);
+  }
+
+  function ensureUserStores() {
+    state.usersByEmail ||= {}; // email -> user
+    state.usersById ||= {};    // id -> user (id == email for now)
+    state.usersByUn ||= {};    // un(lower) -> user
+  }
+
+  function findUserByLogin(login) {
+    ensureUserStores();
+    const key = normId(login);
+    // allow login by email or UN
+    return state.usersByEmail[key] || state.usersByUn[key] || null;
+  }
+
+  function isPaid(cycleId, userId) {
+    const set = paidByCycle.get(Number(cycleId || 0));
+    return !!set?.has(normId(userId));
+  }
+
+  function isHostLogin(login, password) {
+    const attempt = normId(login);
+    const host = state.hostUser;
+    if (!host?.passHash) return false;
+
+    const idMatch =
+      attempt === normId(host.email) || attempt === normId(host.un);
+
+    if (!idMatch) return false;
+
+    return bcrypt.compareSync(String(password || ""), host.passHash);
+  }
+
+  function cipherWindowEnded() {
+    const until = state?.cipherUntil ? Number(state.cipherUntil) : 0;
+    if (!until) return true; // if no cipherUntil, treat as expired/not active
+    return Date.now() >= until;
+  }
+
+  /**
+   * ENTER:
+   * - Create account (UN / Email / PW)
+   * - Create session immediately
+   * - Frontend then goes to Stripe checkout (one-time for this cycle)
+   */
+  router.post("/api/auth/enter", async (req, res) => {
     const { un, email, password } = req.body || {};
-    if (!un || !email || !password) return res.status(400).json({ ok: false });
+    if (!un || !email || !password) {
+      return res.status(400).json({ ok: false, code: "missing_fields" });
+    }
 
-    const userId = email.toLowerCase();
-    if (devicePasswords.has(userId)) return res.status(409).json({ ok: false });
+    ensureUserStores();
 
-    const passHash = await bcrypt.hash(password, 12);
-    devicePasswords.set(userId, { passHash, un: un.toLowerCase(), email: userId, createdAt: Date.now() });
+    const e = normId(email);
+    const unClean = cleanOneLine(un, 24) || "PLAYER";
+    const unKey = normId(unClean);
 
-    res.json({ ok: true });
+    // prevent UN collisions
+    const existingUn = state.usersByUn[unKey];
+    if (existingUn && existingUn.email !== e) {
+      return res.status(409).json({ ok: false, code: "un_taken" });
+    }
+
+    let user = state.usersByEmail[e];
+
+    if (!user) {
+      const passHash = await bcrypt.hash(String(password), 12);
+      user = {
+        id: e, // id is email for MVP
+        email: e,
+        un: unClean,
+        passHash,
+        host: false,
+        createdAt: Date.now(),
+      };
+
+      state.usersByEmail[e] = user;
+      state.usersById[e] = user;
+      state.usersByUn[unKey] = user;
+    } else {
+      // If user exists, require password match (prevents account takeover via "enter")
+      const ok = bcrypt.compareSync(String(password || ""), user.passHash || "");
+      if (!ok) return res.status(401).json({ ok: false, code: "unauthorized" });
+
+      // ensure UN index is correct (if they previously used email-only)
+      state.usersByUn[normId(user.un)] = user;
+      state.usersByUn[unKey] = user;
+      user.un = unClean;
+    }
+
+    // Session created now; payment happens after Stripe checkout
+    // Expiry: if cipher window exists, expire at cipherUntil; otherwise leave null until paid/login
+    const expiresAt = state?.cipherUntil ? Number(state.cipherUntil) : null;
+    setSessionUser(req, user, { expiresAt });
+
+    return res.json({
+      ok: true,
+      un: user.un,
+      email: user.email,
+      host: false,
+      expiresAt,
+      cycleId: Number(state.cycleId || 0),
+    });
   });
 
+  /**
+   * LOGIN:
+   * - UN or Email + PW
+   * - Host bypass (never expires, never requires Stripe)
+   * - Non-host requires paid for current cycle
+   * - If cipher window already ended => treat as expired and force Stripe flow
+   */
   router.post("/api/auth/login", async (req, res) => {
-    const { email, password } = req.body || {};
-    if (!email || !password) return res.status(400).json({ ok: false });
+    const { login, password } = req.body || {};
+    if (!login || !password) {
+      return res.status(400).json({ ok: false, code: "missing_fields" });
+    }
 
-    const userId = email.toLowerCase();
-    const user = devicePasswords.get(userId);
-    if (!user) return res.status(401).json({ ok: false });
+    // Host bypass
+    if (isHostLogin(login, password)) {
+      setSessionUser(req, state.hostUser, { expiresAt: null });
+      return res.json({ ok: true, host: true, un: state.hostUser.un });
+    }
 
-    const match = await bcrypt.compare(password, user.passHash);
-    if (!match) return res.status(401).json({ ok: false });
+    // If cipher window ended, force Stripe flow for non-host
+    if (cipherWindowEnded()) {
+      clearSession(req);
+      return res.status(402).json({
+        ok: false,
+        code: "cycle_expired",
+        message: "This cycle has expired. Please enter again.",
+        cycleId: Number(state.cycleId || 0),
+      });
+    }
 
-    const paidSet = paidByCycle.get(state.cycleId) || new Set();
-    if (!paidSet.has(userId)) return res.status(402).json({ ok: false });
+    // Non-host lookup (email or UN)
+    const user = findUserByLogin(login);
+    if (!user) return res.status(401).json({ ok: false, code: "unauthorized" });
 
-    req.session.userId = userId;
-    req.session.un = user.un;
+    const ok = bcrypt.compareSync(String(password || ""), user.passHash || "");
+    if (!ok) return res.status(401).json({ ok: false, code: "unauthorized" });
 
-    setPassCookie(res, { userId, cycleId: state.cycleId }, state.zeroAt + 24*3600*1000);
-    res.json({ ok: true });
+    const cycleId = Number(state.cycleId || 0);
+
+    // Must be paid for this cycle
+    if (!isPaid(cycleId, user.id)) {
+      clearSession(req);
+      return res.status(402).json({
+        ok: false,
+        code: "not_paid",
+        message: "Payment required for this cycle.",
+        cycleId,
+      });
+    }
+
+    // Expire token at end of 24h window
+    const expiresAt = state?.cipherUntil ? Number(state.cipherUntil) : null;
+    setSessionUser(req, user, { expiresAt });
+
+    return res.json({ ok: true, host: false, un: user.un, expiresAt, cycleId });
   });
 
-  router.post("/api/auth/logout", (req, res) => {
-    req.session.destroy?.(() => {});
-    clearPassCookie(res);
-    res.json({ ok: true });
-  });
-
+  /**
+   * WHOAMI: helpful for frontend boot
+   * - returns session user if valid, otherwise expires it
+   */
   router.get("/api/auth/me", (req, res) => {
-    const authed = !!req.session?.userId;
-    res.json({ ok: authed, un: authed ? req.session.un : null });
+    const exp = enforceSessionExpiry(req, state);
+    if (!exp.ok) return res.status(401).json({ ok: false, code: exp.code });
+    if (!exp.me) return res.json({ ok: true, me: null });
+    return res.json({ ok: true, me: exp.me });
+  });
+
+  /* LOGOUT */
+  router.post("/api/auth/logout", (req, res) => {
+    clearSession(req);
+    req.session?.destroy?.(() => {});
+    return res.json({ ok: true });
   });
 
   return router;
