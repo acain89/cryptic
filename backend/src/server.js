@@ -82,6 +82,16 @@ app.use(express.json({ limit: "256kb" }));
 
 app.use("/api", makeStripeRoutes({ state }));
 
+app.get("/api/__whoami", (req, res) => {
+  res.json({
+    ok: true,
+    service: "cryptic-backend",
+    version: process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT || "unknown",
+    hasStripeRoutes: true,
+  });
+});
+
+
 
 app.get("/api/me", requireFirebaseAuth, (req, res) => {
   res.json({ ok: true, uid: req.user.uid, email: req.user.email });
