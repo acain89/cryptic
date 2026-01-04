@@ -80,7 +80,7 @@ app.use(makeStripeWebhookRoute({ state, paidByCycle }));
 /* JSON BODY */
 app.use(express.json({ limit: "256kb" }));
 
-app.use("/api", makeStripeRoutes({ state }));
+app.use("/api/stripe", makeStripeRoutes({ state }));
 
 app.get("/api/__whoami", (req, res) => {
   res.json({
