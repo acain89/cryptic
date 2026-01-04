@@ -21,8 +21,6 @@ import { initFirebaseAdmin } from "./firebaseAdmin.js";
 import { requireFirebaseAuth } from "./middleware/requireFirebaseAuth.js";
 import { makeStripeRoutes } from "./routes/stripeRoutes.js";
 
-
-
 /**
  * Force a stable server timezone for weekly schedule logic.
  * (Recommended: also set TZ=America/Chicago in Render env vars.)
@@ -31,14 +29,19 @@ if (!process.env.TZ) process.env.TZ = "America/Chicago";
 
 const app = express();
 
+app.get("/", (req, res) => {
+  res.status(200).send("cryptic backend ok");
+});
+
 initFirebaseAdmin();
 
 // If deploying behind Render/NGINX/Cloudflare etc, this enables secure cookies + correct IPs
 app.set("trust proxy", 1);
 
 const isProd = process.env.NODE_ENV === "production";
-app.use(makeStripeWebhookRoute({ paidByCycle }));
 
+/* STRIPE WEBHOOK (must be before json if using raw body inside webhook route) */
+app.use(makeStripeWebhookRoute({ state, paidByCycle }));
 
 /* CORS */
 app.use(
@@ -74,11 +77,13 @@ const server = http.createServer(app);
 const getPublicState = () => _getPublicState(state);
 const { wsBroadcast, pushState } = initWs({ server, getPublicState });
 
-/* STRIPE WEBHOOK (must be before json if using raw body inside webhook route) */
-app.use(makeStripeWebhookRoute({ state, paidByCycle }));
-
 /* JSON BODY */
 app.use(express.json({ limit: "256kb" }));
+
+/* ROOT (so Render URL doesn't show "Cannot GET /") */
+app.get("/", (req, res) => {
+  res.status(200).send("cryptic backend ok");
+});
 
 app.use("/api/stripe", makeStripeRoutes({ state }));
 
@@ -91,12 +96,9 @@ app.get("/api/__whoami", (req, res) => {
   });
 });
 
-
-
 app.get("/api/me", requireFirebaseAuth, (req, res) => {
   res.json({ ok: true, uid: req.user.uid, email: req.user.email });
 });
-
 
 /* ROUTES */
 app.use(makeBasicRoutes({ getPublicState }));

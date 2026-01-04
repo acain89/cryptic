@@ -6,10 +6,8 @@ function parseServiceAccountJSON() {
   if (!raw) return null;
 
   try {
-    // Render often stores JSON as a single line string
     return JSON.parse(raw);
   } catch (e) {
-    // If someone pasted it with escaped newlines, try a cleanup
     try {
       const cleaned = raw.replace(/\\n/g, "\n");
       return JSON.parse(cleaned);
@@ -28,11 +26,12 @@ export function initFirebaseAdmin() {
     return null;
   }
 
+  // 🔥 Use the same env var name you're actually setting
   admin.initializeApp({
     credential: admin.credential.cert(svc),
   });
 
-  console.log("[cryptic] Firebase Admin initialized");
+  console.log("[cryptic] Firebase admin ready");
   return admin;
 }
 
