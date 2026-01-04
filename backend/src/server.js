@@ -19,6 +19,8 @@ import { makeAdminRoutes } from "./routes/adminRoutes.js";
 import { makeSolveRoutes } from "./routes/solveRoutes.js";
 import { initFirebaseAdmin } from "./firebaseAdmin.js";
 import { requireFirebaseAuth } from "./middleware/requireFirebaseAuth.js";
+import { makeStripeRoutes } from "./routes/stripeRoutes.js";
+
 
 
 /**
@@ -77,6 +79,9 @@ app.use(makeStripeWebhookRoute({ state, paidByCycle }));
 
 /* JSON BODY */
 app.use(express.json({ limit: "256kb" }));
+
+app.use("/api", makeStripeRoutes({ state }));
+
 
 app.get("/api/me", requireFirebaseAuth, (req, res) => {
   res.json({ ok: true, uid: req.user.uid, email: req.user.email });
