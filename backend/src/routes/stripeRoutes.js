@@ -6,7 +6,7 @@ export function makeStripeRoutes({ state }) {
   const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
   // Create checkout session
-router.post("/join", async (req, res) => {    
+router.post("/create_session", async (req, res) => {
 try {
       const tier = String(req.body?.tier || "B").toUpperCase();
       const amount = tier === "A" ? state.priceA : tier === "C" ? state.priceC : state.priceB;
